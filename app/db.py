@@ -181,6 +181,148 @@ CREATE TABLE IF NOT EXISTS claim_items (
 CREATE INDEX IF NOT EXISTS idx_claim_items_notification
     ON claim_items (notification_id);
 
+-- ---------------------------------------------------------------------------
+-- Cross-branch resolutions
+--
+-- A child conversation proposes one atomic package to its direct parent. The
+-- proposal keeps private evidence references in the child; the parent-facing
+-- review model exposes only topics, public text and dependencies. Approved
+-- packages create immutable resolution versions, while resolution_board points
+-- at the current version or marks a topic pending reconsideration.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS resolution_approvals (
+    approval_id    TEXT PRIMARY KEY,
+    proposal_id    TEXT NOT NULL UNIQUE,
+    parent_conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    approver_id    TEXT NOT NULL REFERENCES users(id),
+    request_id     TEXT,
+    result_json    TEXT,
+    approved_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resolution_proposals (
+    proposal_id              TEXT PRIMARY KEY,
+    parent_conversation_id   TEXT NOT NULL REFERENCES conversations(id),
+    child_conversation_id    TEXT NOT NULL REFERENCES conversations(id),
+    proposer_id              TEXT NOT NULL REFERENCES users(id),
+    -- Intentionally not a foreign key: removing the child membership deletes
+    -- the membership row, and approval must be able to observe that the exact
+    -- submission-time membership instance is gone even if the user rejoins.
+    proposer_membership_id   TEXT NOT NULL,
+    client_token             TEXT,
+    status                   TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'approved', 'rejected')),
+    rejection_code           TEXT,
+    created_at               TEXT NOT NULL,
+    decided_at               TEXT,
+    approval_id              TEXT REFERENCES resolution_approvals(approval_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_resolution_proposal_client_token
+    ON resolution_proposals (child_conversation_id, proposer_id, client_token)
+    WHERE client_token IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_resolution_proposals_parent_status
+    ON resolution_proposals (parent_conversation_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS resolution_proposal_items (
+    item_id              TEXT PRIMARY KEY,
+    proposal_id          TEXT NOT NULL
+        REFERENCES resolution_proposals(proposal_id),
+    topic_key            TEXT NOT NULL,
+    ordinal              INTEGER NOT NULL,
+    public_text          TEXT NOT NULL,
+    -- The board pointer observed at submission. base_status='absent' means the
+    -- topic had never been passed; effective/pending include the exact version.
+    base_resolution_id   TEXT,
+    base_status          TEXT NOT NULL
+        CHECK (base_status IN ('absent', 'effective', 'pending_reconsideration')),
+    UNIQUE (proposal_id, topic_key),
+    UNIQUE (proposal_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS resolution_proposal_evidence (
+    proposal_item_id TEXT NOT NULL
+        REFERENCES resolution_proposal_items(item_id),
+    message_id       TEXT NOT NULL REFERENCES messages(id),
+    ordinal          INTEGER NOT NULL,
+    PRIMARY KEY (proposal_item_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_evidence_message
+    ON resolution_proposal_evidence (message_id);
+
+CREATE TABLE IF NOT EXISTS resolution_proposal_dependencies (
+    proposal_id              TEXT NOT NULL
+        REFERENCES resolution_proposals(proposal_id),
+    source_topic_key         TEXT NOT NULL,
+    depends_on_topic_key     TEXT NOT NULL,
+    scope                    TEXT NOT NULL CHECK (scope IN ('internal', 'external')),
+    pinned_resolution_id     TEXT,
+    pinned_version           INTEGER,
+    ordinal                  INTEGER NOT NULL,
+    PRIMARY KEY (proposal_id, source_topic_key, depends_on_topic_key)
+);
+
+CREATE TABLE IF NOT EXISTS resolutions (
+    resolution_id          TEXT PRIMARY KEY,
+    parent_conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    topic_key              TEXT NOT NULL,
+    version                INTEGER NOT NULL,
+    proposal_id            TEXT NOT NULL
+        REFERENCES resolution_proposals(proposal_id),
+    approval_id            TEXT NOT NULL
+        REFERENCES resolution_approvals(approval_id),
+    public_text            TEXT NOT NULL,
+    approved_at           TEXT NOT NULL,
+    UNIQUE (parent_conversation_id, topic_key, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolutions_parent_topic
+    ON resolutions (parent_conversation_id, topic_key, version);
+
+CREATE TABLE IF NOT EXISTS resolution_evidence (
+    resolution_id TEXT NOT NULL REFERENCES resolutions(resolution_id),
+    message_id    TEXT NOT NULL REFERENCES messages(id),
+    PRIMARY KEY (resolution_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolution_evidence_message
+    ON resolution_evidence (message_id);
+
+CREATE TABLE IF NOT EXISTS resolution_dependencies (
+    dependency_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    resolution_id             TEXT NOT NULL REFERENCES resolutions(resolution_id),
+    parent_conversation_id    TEXT NOT NULL REFERENCES conversations(id),
+    source_topic_key          TEXT NOT NULL,
+    depends_on_topic_key      TEXT NOT NULL,
+    depends_on_resolution_id  TEXT NOT NULL REFERENCES resolutions(resolution_id),
+    depends_on_version        INTEGER NOT NULL,
+    UNIQUE (resolution_id, depends_on_topic_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolution_dependencies_target
+    ON resolution_dependencies (depends_on_resolution_id);
+
+-- One current board row per topic that has ever had a passed resolution.
+-- Pending rows retain current_resolution_id internally for cascade bookkeeping,
+-- but the HTTP board serializes resolution=NULL so old text is not echoed.
+CREATE TABLE IF NOT EXISTS resolution_board (
+    parent_conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    topic_key              TEXT NOT NULL,
+    current_resolution_id  TEXT NOT NULL UNIQUE REFERENCES resolutions(resolution_id),
+    status                 TEXT NOT NULL
+        CHECK (status IN ('effective', 'pending_reconsideration')),
+    pending_reason         TEXT,
+    invalidated_at         TEXT,
+    updated_at             TEXT NOT NULL,
+    PRIMARY KEY (parent_conversation_id, topic_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolution_board_parent_status
+    ON resolution_board (parent_conversation_id, status);
+
 -- Defence in depth: messages are append-only. The only permitted UPDATE is the
 -- one that clears the body and flips the retraction marker. Origin identity and
 -- authorship can never be rewritten, and rows can never be deleted.

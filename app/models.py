@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -112,6 +118,149 @@ class ClaimRequest(StrictModel):
 class ConfirmRequest(StrictModel):
     batch_id: str = Field(min_length=1, max_length=100)
     notification_id: str = Field(min_length=1, max_length=100)
+
+
+class ProposedResolutionRequest(StrictModel):
+    topic_key: str = Field(
+        min_length=1,
+        max_length=100,
+        validation_alias=AliasChoices("topic_key", "topic", "topic_id", "key"),
+    )
+    public_text: str = Field(
+        min_length=1,
+        max_length=20_000,
+        validation_alias=AliasChoices(
+            "public_text", "text", "resolution_text", "wording"
+        ),
+    )
+    evidence_message_ids: list[str] = Field(
+        min_length=1,
+        max_length=100,
+        validation_alias=AliasChoices(
+            "evidence_message_ids",
+            "basis_message_ids",
+            "evidence",
+            "bases",
+        ),
+    )
+    depends_on_topic_keys: list[Any] = Field(
+        default_factory=list,
+        max_length=100,
+        validation_alias=AliasChoices(
+            "depends_on_topic_keys",
+            "depends_on",
+            "dependencies",
+            "requires_topics",
+        ),
+    )
+
+    @field_validator("topic_key")
+    @classmethod
+    def _clean_topic(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("topic_key must not be blank")
+        return cleaned
+
+    @field_validator("public_text")
+    @classmethod
+    def _clean_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("public_text must not be blank")
+        return value
+
+    @field_validator("evidence_message_ids")
+    @classmethod
+    def _clean_evidence(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in value:
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("evidence_message_ids must contain non-blank ids")
+            item = raw.strip()
+            if item not in cleaned:
+                cleaned.append(item)
+        if not cleaned:
+            raise ValueError("at least one evidence message is required")
+        return cleaned
+
+    @field_validator("depends_on_topic_keys")
+    @classmethod
+    def _clean_dependencies(cls, value: list[Any]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in value:
+            if isinstance(raw, dict):
+                raw = raw.get("topic_key") or raw.get("topic") or raw.get("topic_id")
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("dependency topics must be non-blank strings")
+            topic = raw.strip()
+            if topic not in cleaned:
+                cleaned.append(topic)
+        return cleaned
+
+
+class CreateResolutionProposalRequest(StrictModel):
+    # A top-level POST /resolution-proposals supplies the child here. The
+    # conversation-scoped route can either be the child itself or the parent;
+    # in the latter case child_conversation_id identifies the source branch.
+    child_conversation_id: str | None = Field(
+        default=None,
+        max_length=100,
+        validation_alias=AliasChoices(
+            "child_conversation_id",
+            "source_conversation_id",
+            "subconversation_id",
+        ),
+    )
+    parent_conversation_id: str | None = Field(
+        default=None,
+        max_length=100,
+        validation_alias=AliasChoices(
+            "parent_conversation_id", "board_conversation_id"
+        ),
+    )
+    items: list[ProposedResolutionRequest] = Field(min_length=1, max_length=100)
+    client_token: str | None = Field(
+        default=None,
+        max_length=200,
+        validation_alias=AliasChoices("client_token", "request_id", "idempotency_key"),
+    )
+
+    @field_validator(
+        "child_conversation_id", "parent_conversation_id", "client_token"
+    )
+    @classmethod
+    def _clean_optional_token(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+    def service_items(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "topic_key": item.topic_key,
+                "public_text": item.public_text,
+                "evidence_message_ids": item.evidence_message_ids,
+                "depends_on_topic_keys": item.depends_on_topic_keys,
+            }
+            for item in self.items
+        ]
+
+
+class ApproveResolutionProposalRequest(StrictModel):
+    request_id: str | None = Field(
+        default=None,
+        max_length=200,
+        validation_alias=AliasChoices("request_id", "approval_request_id"),
+    )
+
+    @field_validator("request_id")
+    @classmethod
+    def _clean_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
 
 
 # ---------------------------------------------------------------------------

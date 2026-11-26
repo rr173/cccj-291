@@ -25,6 +25,7 @@ from .errors import (
 from .models import (
     AddMemberRequest,
     AppendMessageRequest,
+    ApproveResolutionProposalRequest,
     ClaimBatchOut,
     ClaimRequest,
     ConfirmOut,
@@ -32,6 +33,7 @@ from .models import (
     ConversationDetail,
     ConversationOut,
     CreateConversationRequest,
+    CreateResolutionProposalRequest,
     CreateUserRequest,
     EventOut,
     FollowOut,
@@ -368,6 +370,266 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         service.authenticate(user_id)
         return service.retract_message(message_id, user_id)
+
+    # ------------------------------------------------------------------
+    # Resolution proposals, parent-board review and approval
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/conversations/{conversation_id}/resolution-proposals",
+        status_code=201,
+        tags=["resolutions"],
+        summary=(
+            "Submit an atomic resolution package from a child branch. With a "
+            "child_conversation_id body field, this path is the direct parent."
+        ),
+    )
+    @app.post(
+        "/conversations/{conversation_id}/proposals",
+        status_code=201,
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def create_resolution_proposal(
+        conversation_id: str,
+        body: CreateResolutionProposalRequest,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        if (
+            body.child_conversation_id is not None
+            and body.child_conversation_id != conversation_id
+        ):
+            child_id = body.child_conversation_id
+            expected_parent_id: str | None = conversation_id
+        else:
+            child_id = conversation_id
+            expected_parent_id = None
+        proposal, created = service.create_resolution_proposal(
+            child_id,
+            user_id,
+            body.service_items(),
+            client_token=body.client_token,
+            expected_parent_conversation_id=expected_parent_id,
+        )
+        response.status_code = 201 if created else 200
+        return proposal
+
+    @app.post(
+        "/resolution-proposals",
+        status_code=201,
+        tags=["resolutions"],
+        include_in_schema=False,
+        summary="Create a proposal by explicitly supplying its child conversation",
+    )
+    def create_resolution_proposal_top_level(
+        body: CreateResolutionProposalRequest,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        if body.child_conversation_id is None:
+            raise ApiError(
+                422,
+                "validation_error",
+                "child_conversation_id is required on POST /resolution-proposals",
+            )
+        proposal, created = service.create_resolution_proposal(
+            body.child_conversation_id,
+            user_id,
+            body.service_items(),
+            client_token=body.client_token,
+            expected_parent_conversation_id=body.parent_conversation_id,
+        )
+        response.status_code = 201 if created else 200
+        return proposal
+
+    @app.get(
+        "/conversations/{conversation_id}/resolution-proposals",
+        tags=["resolutions"],
+        summary="List incoming proposals for a parent board (parent owner only)",
+    )
+    @app.get(
+        "/conversations/{conversation_id}/proposals",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def list_resolution_proposals(
+        conversation_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        status: Annotated[
+            str | None, Query(pattern="^(pending|approved|rejected)$")
+        ] = None,
+    ) -> list[dict[str, Any]]:
+        service.authenticate(user_id)
+        return service.list_resolution_proposals(
+            conversation_id, user_id, status=status
+        )
+
+    @app.get(
+        "/conversations/{conversation_id}/resolution-board",
+        tags=["resolutions"],
+        summary="Read the formal resolution board (members of this parent only)",
+    )
+    @app.get(
+        "/conversations/{conversation_id}/board",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    @app.get(
+        "/conversations/{conversation_id}/resolutions",
+        tags=["resolutions"],
+        summary="Alias of the resolution board",
+    )
+    def get_resolution_board(
+        conversation_id: str, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_resolution_board(conversation_id, user_id)
+
+    @app.get(
+        "/conversations/{conversation_id}/resolution-board/{topic_key}",
+        tags=["resolutions"],
+        summary="Read one topic on the formal resolution board",
+    )
+    @app.get(
+        "/conversations/{conversation_id}/resolutions/{topic_key}",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def get_resolution_topic(
+        conversation_id: str,
+        topic_key: str,
+        user_id: UserDep,
+        service: ServiceDep,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_resolution_topic(conversation_id, user_id, topic_key)
+
+    @app.get(
+        "/conversations/{conversation_id}/resolution-proposals/{proposal_id}",
+        tags=["resolutions"],
+        include_in_schema=False,
+        summary="Parent-scoped alias for reading one proposal",
+    )
+    @app.get(
+        "/conversations/{conversation_id}/proposals/{proposal_id}",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def get_parent_scoped_resolution_proposal(
+        conversation_id: str,
+        proposal_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_resolution_proposal(
+            proposal_id,
+            user_id,
+            expected_parent_conversation_id=conversation_id,
+        )
+
+    @app.get(
+        "/resolution-proposals/{proposal_id}",
+        tags=["resolutions"],
+        summary=(
+            "Read one proposal as its proposer or as the direct parent's owner; "
+            "retracted-basis pending text is redacted"
+        ),
+    )
+    @app.get(
+        "/proposals/{proposal_id}",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def get_resolution_proposal(
+        proposal_id: str, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_resolution_proposal(proposal_id, user_id)
+
+    @app.post(
+        "/resolution-proposals/{proposal_id}/approve",
+        tags=["resolutions"],
+        summary=(
+            "Approve and atomically apply a package (direct parent owner only); "
+            "retrying an approved proposal returns its original approval result"
+        ),
+    )
+    @app.post(
+        "/resolution-proposals/{proposal_id}/approval",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    @app.post(
+        "/resolution-proposals/{proposal_id}/approvals",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    @app.post(
+        "/proposals/{proposal_id}/approve",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    @app.post(
+        "/proposals/{proposal_id}/approval",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def approve_resolution_proposal(
+        proposal_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+        body: ApproveResolutionProposalRequest | None = None,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        request_id = body.request_id if body is not None else None
+        result, created = service.approve_resolution_proposal(
+            proposal_id, user_id, request_id=request_id
+        )
+        response.status_code = 201 if created else 200
+        return result
+
+    @app.post(
+        "/conversations/{conversation_id}/resolution-proposals/{proposal_id}/approve",
+        tags=["resolutions"],
+        include_in_schema=False,
+        summary="Parent-scoped alias for approving one proposal",
+    )
+    @app.post(
+        "/conversations/{conversation_id}/resolution-proposals/{proposal_id}/approval",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    @app.post(
+        "/conversations/{conversation_id}/proposals/{proposal_id}/approve",
+        tags=["resolutions"],
+        include_in_schema=False,
+    )
+    def approve_parent_scoped_resolution_proposal(
+        conversation_id: str,
+        proposal_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+        body: ApproveResolutionProposalRequest | None = None,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        request_id = body.request_id if body is not None else None
+        result, created = service.approve_resolution_proposal(
+            proposal_id,
+            user_id,
+            request_id=request_id,
+            expected_parent_conversation_id=conversation_id,
+        )
+        response.status_code = 201 if created else 200
+        return result
 
     # ------------------------------------------------------------------
     # Notification inbox (claim / confirm)

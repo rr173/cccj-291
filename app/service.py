@@ -23,6 +23,7 @@ from typing import Any, Iterator
 from .cursor import CursorCodec, InvalidCursor, query_fingerprint
 from .db import Database, read_transaction, write_transaction
 from .errors import ApiError
+from .resolutions import ResolutionMixin
 
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
@@ -69,7 +70,7 @@ def clamp_limit(limit: int | None) -> int:
     return max(1, min(int(limit), MAX_PAGE_SIZE))
 
 
-class ConversationService:
+class ConversationService(ResolutionMixin):
     def __init__(
         self,
         db_path: str,
@@ -885,6 +886,11 @@ class ConversationService:
                     WHERE id = ?
                     """,
                     (now, actor_id, message_id),
+                )
+                # In the same commit, hide any board resolution whose evidence
+                # was just retracted and propagate pending state downstream.
+                self.invalidate_board_for_retracted_message(
+                    conn, message_id, actor_id, now
                 )
                 # One audit row in the origin and one in each branch that holds
                 # a reference: every branch's log explains why its view changed,

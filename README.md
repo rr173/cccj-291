@@ -9,6 +9,13 @@ Members can **follow** a conversation and be **mentioned** by an author; both
 produce **offline notifications** that devices pick up from a personal inbox
 with short-lived, leased claim batches — no external push involved.
 
+Child members can also turn a supported branch discussion into an atomic
+**resolution package** for its direct parent. The parent owner reviews only the
+proposed topics, public wording and dependencies, then approves the whole
+package at once. A parent **resolution board** shows the current resolution for
+each topic and moves topics plus downstream dependents to reconsideration when
+evidence or pinned dependency versions lapse.
+
 ## Quick start
 
 ```bash
@@ -46,6 +53,10 @@ There is no password/token provider — this is a local, reproducible service.
 | Why a notification exists | `notification_reasons` — points at a `follow_id` or `membership_id` |
 | Claim batch (the credential) | `claim_batches`, unique per (recipient, request_id), with `expires_at` |
 | Batch contents | `claim_items` — plus the confirmation marker |
+| Resolution proposal/package | `resolution_proposals`, `resolution_proposal_items`, evidence and dependency pins |
+| Passed resolution versions | `resolutions`, `resolution_evidence`, `resolution_dependencies` |
+| Current parent board pointer | `resolution_board` — effective or `pending_reconsideration` per `(parent, topic)` |
+| Idempotent approval result | `resolution_approvals`, including the stored original response snapshot |
 | Commit-ordered audit | `events`, auto-increment `seq` |
 
 A fork copies **references**, never content. That single decision gives the
@@ -71,6 +82,65 @@ the user who forked it; parent members get no automatic access. A child member
 may see the inherited prefix without belonging to any ancestor. Only the owner
 (role `owner`, assigned to the forker/creator) may invite or remove members, and
 the owner cannot be removed.
+
+### Resolution boards and cross-branch approval
+
+A branch can propose formal wording to its **direct parent** without forwarding
+or exposing the branch chat. A proposal is an all-or-nothing package:
+
+* each item identifies a `topic_key` and contains `public_text`;
+* each item cites one or more evidence messages; every cited message must be a
+  **local original of the child conversation**, not an inherited message, and
+  must be unretracted at submission;
+* `depends_on_topic_keys` may name other topics. A topic present in the same
+  package is an **internal** dependency and is pinned to the new package
+  version. Any other dependency is **external** and is pinned to the resolution
+  version effective in the parent when the proposal is submitted;
+* duplicate topics, self/cyclic dependencies, invalid evidence and missing
+  effective external premises are rejected at submission.
+
+The proposal stores the proposer's exact child `membership_id`. Removing the
+proposer deletes that row; being invited back mints a new id, so a
+leave-and-rejoin proposer cannot cure a stale proposal.
+
+Review is deliberately narrow. The parent owner sees topics, public wording and
+dependency pins, but the API never serializes evidence message ids or bodies.
+If a pending proposal's evidence is retracted, its `public_text` becomes `null`
+and `text_visible` becomes `false`; approval then fails with `409 basis_retracted`.
+
+Approval is owner-only and atomic. Under one `BEGIN IMMEDIATE` transaction the
+service rechecks:
+
+1. the submission-time child membership id still exists;
+2. every evidence message is still unretracted;
+3. each package topic is still at its submission base and, if it was effective
+   at submission, has not become `pending_reconsideration`;
+4. every external dependency is still the exact effective version pinned at
+   submission;
+5. applying the package would not cascade-invalidate one of those external
+   premises. This catches the “old A depends on old B, but this package would
+   replace B while relying on old A” case with
+   `external_premise_would_lapse`.
+
+Any failed check rolls the whole package back. Unrelated topics do not block.
+The first successful approval returns `201`; retrying the same approval returns
+`200` with the same `approval_id`, resolution ids and stored result snapshot
+(`already_approved: true`) and writes no new resolution versions. Concurrent
+approvals are serialized by SQLite; exactly one creates the package.
+
+The board is scoped to one parent conversation. Each topic has at most one
+current pointer. An effective topic contains the latest passed version and its
+exact dependency pins. When evidence is retracted, that topic becomes
+`pending_reconsideration`; when a pinned dependency version is replaced or
+becomes pending, direct and transitive dependents become pending too. Pending
+topics serialize `resolution: null`, so neither the old wording nor earlier
+versions are echoed. Unrelated topics stay unchanged. Posting the same chat
+text again creates a new message but never automatically restores an old
+resolution. Approval itself survives the proposer later leaving the child.
+
+All proposal, approval and board tables are additive. Opening an old database
+runs `CREATE TABLE/INDEX IF NOT EXISTS`; existing conversations, messages,
+memberships and notification rows are not rebuilt or deleted.
 
 ### Offline notifications
 
@@ -169,6 +239,68 @@ rejected with `400 fork_point_not_visible`.
 | `POST` | `/conversations/{id}/members` | `{user_id}`, owner only; `201` new / `200` existing |
 | `DELETE` | `/conversations/{id}/members/{user_id}` | owner only; `204`; invalidates that user's cursors |
 
+### Resolutions and cross-branch approval
+
+All routes use the same `X-User-Id` authentication. Parent board reads require
+current membership in the parent; review queues and approval require the
+parent's current owner. The proposer may read their own proposal even if they
+are not a parent member.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/conversations/{child_id}/resolution-proposals` | A current child member submits an atomic package to the child's direct parent. Optional `client_token` gives `201`/`200` idempotent submission. |
+| `POST` | `/conversations/{parent_id}/resolution-proposals` | Same operation when the body contains `child_conversation_id`; verifies that the body child is a direct child of the path parent. |
+| `POST` | `/resolution-proposals` | Compatibility form requiring `child_conversation_id`; optional `parent_conversation_id` is checked as the direct parent. |
+| `GET` | `/conversations/{parent_id}/resolution-proposals?status=pending` | Parent owner only; lists incoming/all proposals. Ordinary parent members receive `403 owner_required`. |
+| `GET` | `/resolution-proposals/{proposal_id}` | Proposer or direct-parent owner. Pending items with retracted evidence have `public_text: null`. The same detail/approval operations also exist under `/conversations/{parent_id}/resolution-proposals/{proposal_id}`. |
+| `POST` | `/resolution-proposals/{proposal_id}/approve` | Direct-parent owner only; atomically applies the package. First success is `201`, replay is `200` with the original approval result. `/approval` and `/proposals/{id}/approve` are aliases. |
+| `GET` | `/conversations/{parent_id}/resolution-board` | Parent members only. Returns `{conversation_id, topics[]}`; `/resolutions` is an alias and also repeats the rows as `resolutions`/`items`. |
+| `GET` | `/conversations/{parent_id}/resolution-board/{topic_key}` | Parent members only; reads one board topic. `/conversations/{parent_id}/resolutions/{topic_key}` is an alias. |
+
+Request body:
+
+```json
+{
+  "client_token": "optional-retry-token",
+  "items": [
+    {
+      "topic_key": "refunds",
+      "public_text": "Refunds are allowed for 30 days.",
+      "evidence_message_ids": ["msg_child_local_one", "msg_child_local_two"],
+      "depends_on_topic_keys": ["safety"]
+    },
+    {
+      "topic_key": "safety",
+      "public_text": "Escalate harmful refund requests.",
+      "evidence_message_ids": ["msg_child_local_three"],
+      "depends_on_topic_keys": ["charter"]
+    }
+  ]
+}
+```
+
+In that example `safety` is an internal package dependency, while `charter` is
+external and must already be effective in the parent. The approval response
+contains `approval_id`, stable `resolution_ids`, versioned `resolutions[]`, and
+`invalidated_topics[]` describing the impact radius. The board represents a
+pending topic as:
+
+```json
+{
+  "topic_key": "refunds",
+  "status": "pending_reconsideration",
+  "resolution": null,
+  "pending_reason": "basis_retracted",
+  "invalidated_at": "2026-11-26T07:50:00.000000Z"
+}
+```
+
+`pending_reason` is one of `basis_retracted`, `dependency_replaced`, or
+`dependency_pending`. Approval conflicts use `409` with codes such as
+`proposer_membership_lapsed`, `basis_retracted`, `topic_updated_elsewhere`,
+`topic_pending_reconsideration`, `external_dependency_changed`,
+`external_dependency_lapsed`, or `external_premise_would_lapse`.
+
 ### Messages
 
 | Method | Path | Notes |
@@ -229,13 +361,27 @@ timestamp.
 
 ## Tests and demo
 
-* `tests/` — 49 tests covering two-level forks, cross-branch retraction,
+* `tests/` — 62 tests covering two-level forks, cross-branch retraction,
   idempotent retries, cursor invalidation, snapshot-consistent paging, race
-  outcomes, restart persistence, storage-level immutability, and the
-  notification inbox: dual-source reason invalidation (unfollow vs. member
-  removal vs. retraction), two devices racing for one inbox, lease expiry and
-  re-claim with a fresh credential, and batch/confirmation survival across
-  restarts.
+  outcomes, restart persistence, storage-level immutability, the
+  notification inbox, and cross-branch resolution packages: atomic approval,
+  parent/proposer authorization, evidence privacy and redaction, submission
+  pins, stale/external conflicts, leave-and-rejoin membership identity,
+  idempotent approval replay, and retraction/replacement invalidation chains.
+* `tests/test_resolutions.py` can be run alone with
+  `.venv/bin/python -m pytest tests/test_resolutions.py -q`.
+* `scripts/verify_resolutions.py` — self-contained HTTP-level narrative check
+  using FastAPI `TestClient` against a temporary SQLite file. It
+  creates users and branches, approves a package with internal and external
+  dependencies, checks review privacy and access boundaries, retracts evidence,
+  prints the affected board radius, redacts a pending proposal, restarts a
+  second app against the same SQLite file, and replays the approval. Run:
+
+  ```bash
+  .venv/bin/python scripts/verify_resolutions.py
+  ```
+
+  It prints `33 checks passed` and exits non-zero on failure.
 * `scripts/demo.py` — starts a real uvicorn server, drives it over HTTP as
   Alice/Bob/Carol/Dave, exercises two fork levels, parent/child divergence,
   cross-branch retraction and old cursors, the follow → mention → claim →
