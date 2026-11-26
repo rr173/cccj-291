@@ -25,11 +25,16 @@ from .errors import (
 from .models import (
     AddMemberRequest,
     AppendMessageRequest,
+    ClaimBatchOut,
+    ClaimRequest,
+    ConfirmOut,
+    ConfirmRequest,
     ConversationDetail,
     ConversationOut,
     CreateConversationRequest,
     CreateUserRequest,
     EventOut,
+    FollowOut,
     ForkRequest,
     HealthOut,
     MemberOut,
@@ -226,6 +231,54 @@ def create_app(database_path: str | None = None) -> FastAPI:
         return Response(status_code=204)
 
     # ------------------------------------------------------------------
+    # Follows (notification subscription for one conversation)
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/conversations/{conversation_id}/follow",
+        response_model=FollowOut,
+        status_code=201,
+        tags=["follows"],
+        summary="Follow this conversation; 200 when already following",
+    )
+    def follow_conversation(
+        conversation_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        status, created = service.follow_conversation(conversation_id, user_id)
+        if not created:
+            response.status_code = 200
+        return status
+
+    @app.delete(
+        "/conversations/{conversation_id}/follow",
+        status_code=204,
+        tags=["follows"],
+        summary="Unfollow; idempotent, kills only this follow instance's reasons",
+    )
+    def unfollow_conversation(
+        conversation_id: str, user_id: UserDep, service: ServiceDep
+    ) -> Response:
+        service.authenticate(user_id)
+        service.unfollow_conversation(conversation_id, user_id)
+        return Response(status_code=204)
+
+    @app.get(
+        "/conversations/{conversation_id}/follow",
+        response_model=FollowOut,
+        tags=["follows"],
+        summary="Whether the caller currently follows this conversation",
+    )
+    def get_follow_status(
+        conversation_id: str, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_follow_status(conversation_id, user_id)
+
+    # ------------------------------------------------------------------
     # Messages
     # ------------------------------------------------------------------
 
@@ -245,7 +298,11 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         service.authenticate(user_id)
         message, created = service.append_message(
-            conversation_id, user_id, body.body, body.client_token
+            conversation_id,
+            user_id,
+            body.body,
+            body.client_token,
+            body.mention_user_ids,
         )
         # A retry returns the original result rather than creating a new one.
         if not created:
@@ -311,6 +368,42 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         service.authenticate(user_id)
         return service.retract_message(message_id, user_id)
+
+    # ------------------------------------------------------------------
+    # Notification inbox (claim / confirm)
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/notifications/claim",
+        response_model=ClaimBatchOut,
+        tags=["notifications"],
+        summary=(
+            "Claim a leased batch of pending notifications; retrying the same "
+            "request_id replays the original batch"
+        ),
+    )
+    def claim_notifications(
+        body: ClaimRequest, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.claim_notifications(user_id, body.request_id, body.limit)
+
+    @app.post(
+        "/notifications/confirm",
+        response_model=ConfirmOut,
+        tags=["notifications"],
+        summary=(
+            "Confirm one claimed notification with its batch credential "
+            "(idempotent)"
+        ),
+    )
+    def confirm_notification(
+        body: ConfirmRequest, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.confirm_notification(
+            user_id, body.batch_id, body.notification_id
+        )
 
     # ------------------------------------------------------------------
     # Audit

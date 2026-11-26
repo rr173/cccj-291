@@ -17,7 +17,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from .cursor import CursorCodec, InvalidCursor, query_fingerprint
@@ -27,6 +27,9 @@ from .errors import ApiError
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
 MAX_SEARCH_TERMS = 16
+# How long a claimed batch stays confirmable and stays off other devices'
+# claims. Stored per batch, so it keeps expiring across restarts.
+DEFAULT_CLAIM_LEASE_SECONDS = 30.0
 
 _MESSAGE_COLUMNS = """
     cm.position          AS conv_position,
@@ -67,10 +70,18 @@ def clamp_limit(limit: int | None) -> int:
 
 
 class ConversationService:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS,
+    ) -> None:
         self.db = Database(db_path)
         self.db.initialize()
         self.codec = CursorCodec(self.db.secret)
+        if claim_lease_seconds <= 0:
+            raise ValueError("claim_lease_seconds must be positive")
+        self._claim_lease = timedelta(seconds=claim_lease_seconds)
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -256,6 +267,14 @@ class ConversationService:
                     "DELETE FROM memberships WHERE membership_id = ?",
                     (target["membership_id"],),
                 )
+                # Losing membership ends every reason this membership instance
+                # carried: mention reasons reference the deleted membership_id
+                # directly, and follow reasons die with the follow rows here.
+                # Re-invitation mints new ids and revives nothing.
+                conn.execute(
+                    "DELETE FROM follows WHERE conversation_id = ? AND user_id = ?",
+                    (conversation_id, user_id),
+                )
                 self._record_event(
                     conn,
                     "member.removed",
@@ -269,6 +288,113 @@ class ConversationService:
                 )
 
     # ------------------------------------------------------------------
+    # Follows (per-member notification subscription)
+    # ------------------------------------------------------------------
+
+    def follow_conversation(
+        self, conversation_id: str, user_id: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Subscribe a member to notifications for new original messages.
+
+        Following is not retroactive: only messages appended after this call
+        notify the follower. Re-following after an unfollow mints a new follow
+        instance; it never revives reasons the old instance left behind.
+        """
+        now = utcnow()
+        with self._connect() as conn:
+            with write_transaction(conn):
+                self._require_conversation(conn, conversation_id)
+                self._require_membership(conn, conversation_id, user_id)
+                existing = conn.execute(
+                    """
+                    SELECT follow_id, created_at FROM follows
+                    WHERE conversation_id = ? AND user_id = ?
+                    """,
+                    (conversation_id, user_id),
+                ).fetchone()
+                if existing is not None:
+                    return (
+                        self._follow_dict(conversation_id, user_id, existing),
+                        False,
+                    )
+                follow_id = new_id("fol")
+                conn.execute(
+                    """
+                    INSERT INTO follows (follow_id, conversation_id, user_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (follow_id, conversation_id, user_id, now),
+                )
+                self._record_event(
+                    conn,
+                    "conversation.followed",
+                    conversation_id,
+                    user_id,
+                    details={"follow_id": follow_id},
+                    occurred_at=now,
+                )
+                row = conn.execute(
+                    "SELECT follow_id, created_at FROM follows WHERE follow_id = ?",
+                    (follow_id,),
+                ).fetchone()
+                assert row is not None
+                return self._follow_dict(conversation_id, user_id, row), True
+
+    def unfollow_conversation(self, conversation_id: str, user_id: str) -> None:
+        """End the current follow instance (idempotent).
+
+        Deleting the follow row kills exactly the follow reasons minted from
+        it; mention reasons on the same notifications are untouched.
+        """
+        now = utcnow()
+        with self._connect() as conn:
+            with write_transaction(conn):
+                self._require_conversation(conn, conversation_id)
+                self._require_membership(conn, conversation_id, user_id)
+                cursor = conn.execute(
+                    """
+                    DELETE FROM follows
+                    WHERE conversation_id = ? AND user_id = ?
+                    """,
+                    (conversation_id, user_id),
+                )
+                if cursor.rowcount:
+                    self._record_event(
+                        conn,
+                        "conversation.unfollowed",
+                        conversation_id,
+                        user_id,
+                        occurred_at=now,
+                    )
+
+    def get_follow_status(
+        self, conversation_id: str, user_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            with read_transaction(conn):
+                self._require_conversation(conn, conversation_id)
+                self._require_membership(conn, conversation_id, user_id)
+                row = conn.execute(
+                    """
+                    SELECT follow_id, created_at FROM follows
+                    WHERE conversation_id = ? AND user_id = ?
+                    """,
+                    (conversation_id, user_id),
+                ).fetchone()
+                return self._follow_dict(conversation_id, user_id, row)
+
+    @staticmethod
+    def _follow_dict(
+        conversation_id: str, user_id: str, row: sqlite3.Row | None
+    ) -> dict[str, Any]:
+        return {
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "following": row is not None,
+            "followed_at": row["created_at"] if row is not None else None,
+        }
+
+    # ------------------------------------------------------------------
     # Messages: append, read, search, fork
     # ------------------------------------------------------------------
 
@@ -278,12 +404,19 @@ class ConversationService:
         user_id: str,
         body: str,
         client_token: str | None,
+        mention_user_ids: list[str] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Append an immutable message; write transactions give a commit order.
 
         ``client_token`` deduplicates retries. Note that the inserted message is
         the original; subsequent forks reference this very row.
+
+        ``mention_user_ids`` names current members to notify explicitly. A
+        successful append also creates offline notifications for the members
+        who follow the conversation right now; a deduplicated retry creates
+        none and never changes the original recipients.
         """
+        mentions = list(mention_user_ids or [])
         now = utcnow()
         with self._connect() as conn:
             with write_transaction(conn):
@@ -307,6 +440,13 @@ class ConversationService:
                             ),
                             False,
                         )
+
+                # Mentions are validated only on the create path: a retry of an
+                # already-committed append must return the original result
+                # unchanged, whatever the retried payload carries.
+                mention_memberships = self._resolve_mentions(
+                    conn, conversation_id, mentions
+                )
 
                 position = conn.execute(
                     """
@@ -342,13 +482,25 @@ class ConversationService:
                     """,
                     (conversation_id, position, message_id),
                 )
+                notified = self._create_notifications(
+                    conn,
+                    message_id=message_id,
+                    conversation_id=conversation_id,
+                    author_id=user_id,
+                    mention_memberships=mention_memberships,
+                    now=now,
+                )
                 self._record_event(
                     conn,
                     "message.appended",
                     conversation_id,
                     user_id,
                     message_id=message_id,
-                    details={"position": position},
+                    details={
+                        "position": position,
+                        "mentions": sorted(mention_memberships),
+                        "notified_recipients": len(notified),
+                    },
                     occurred_at=now,
                 )
                 return (
@@ -778,6 +930,410 @@ class ConversationService:
             finally:
                 conn.execute("PRAGMA busy_timeout=30000")
         return result
+
+    # ------------------------------------------------------------------
+    # Offline notifications: personal inbox, leased claims, confirmation
+    # ------------------------------------------------------------------
+
+    def claim_notifications(
+        self, user_id: str, request_id: str, limit: int | None
+    ) -> dict[str, Any]:
+        """Claim a leased batch of the caller's pending notifications.
+
+        A fresh ``request_id`` takes the oldest claimable notifications (origin
+        submission order), skipping items another live lease still holds, and
+        leases them to this batch for ``claim_lease_seconds``. Retrying an
+        existing ``request_id`` is a pure replay: it returns the still-valid,
+        still-unconfirmed, still-owned slice of the original batch — never new
+        items, never a longer lease.
+        """
+        page_size = clamp_limit(limit)
+        now = utcnow()
+        with self._connect() as conn:
+            with write_transaction(conn):
+                self._ensure_user(conn, user_id)
+                batch = conn.execute(
+                    """
+                    SELECT * FROM claim_batches
+                    WHERE recipient_id = ? AND request_id = ?
+                    """,
+                    (user_id, request_id),
+                ).fetchone()
+                if batch is not None:
+                    items = self._claim_replay_items(conn, batch)
+                    return self._claim_dict(batch, items)
+
+                batch_id = new_id("clm")
+                expires_at = self._lease_expiry(now)
+                conn.execute(
+                    """
+                    INSERT INTO claim_batches
+                        (batch_id, request_id, recipient_id, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (batch_id, request_id, user_id, now, expires_at),
+                )
+                rows = conn.execute(
+                    """
+                    SELECT n.notification_id
+                    FROM notifications n
+                    JOIN messages m ON m.id = n.message_id
+                    WHERE n.recipient_id = :recipient
+                      AND m.retracted = 0
+                      AND EXISTS (
+                          SELECT 1 FROM notification_reasons r
+                          WHERE r.notification_id = n.notification_id
+                            AND (
+                              (r.kind = 'follow' AND EXISTS (
+                                  SELECT 1 FROM follows f
+                                  WHERE f.follow_id = r.source_id))
+                              OR
+                              (r.kind = 'mention' AND EXISTS (
+                                  SELECT 1 FROM memberships mem
+                                  WHERE mem.membership_id = r.source_id))
+                            )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM claim_items done
+                          WHERE done.notification_id = n.notification_id
+                            AND done.confirmed_at IS NOT NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM claim_items held
+                          JOIN claim_batches other
+                            ON other.batch_id = held.batch_id
+                          WHERE held.notification_id = n.notification_id
+                            AND held.confirmed_at IS NULL
+                            AND other.expires_at > :now
+                      )
+                    ORDER BY n.seq ASC
+                    LIMIT :limit
+                    """,
+                    {"recipient": user_id, "now": now, "limit": page_size},
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO claim_items (batch_id, notification_id)
+                        VALUES (?, ?)
+                        """,
+                        (batch_id, row["notification_id"]),
+                    )
+                items = [
+                    self._notification_dict(conn, row["notification_id"])
+                    for row in rows
+                ]
+                batch = conn.execute(
+                    "SELECT * FROM claim_batches WHERE batch_id = ?", (batch_id,)
+                ).fetchone()
+                assert batch is not None
+                return self._claim_dict(batch, items)
+
+    def confirm_notification(
+        self, user_id: str, batch_id: str, notification_id: str
+    ) -> dict[str, Any]:
+        """Confirm one claimed notification with its batch credential.
+
+        Confirmation requires a live lease and a still-valid notification. A
+        retried confirmation of an already-confirmed item is a no-op that
+        succeeds without returning the body again.
+        """
+        now = utcnow()
+        with self._connect() as conn:
+            with write_transaction(conn):
+                self._ensure_user(conn, user_id)
+                batch = conn.execute(
+                    "SELECT * FROM claim_batches WHERE batch_id = ?", (batch_id,)
+                ).fetchone()
+                if batch is None:
+                    raise ApiError(404, "batch_not_found", "no claim batch has that id")
+                if batch["recipient_id"] != user_id:
+                    raise ApiError(
+                        403,
+                        "not_batch_owner",
+                        "this claim batch belongs to another user",
+                    )
+                item = conn.execute(
+                    """
+                    SELECT * FROM claim_items
+                    WHERE batch_id = ? AND notification_id = ?
+                    """,
+                    (batch_id, notification_id),
+                ).fetchone()
+                if item is None:
+                    raise ApiError(
+                        404,
+                        "notification_not_in_batch",
+                        "that notification is not part of this claim batch",
+                    )
+                if item["confirmed_at"] is not None:
+                    # Idempotent replay of a successful confirmation: no state
+                    # change, no body, valid even after the lease expired.
+                    return self._confirm_dict(
+                        batch_id, notification_id, item["confirmed_at"],
+                        already=True, message=None,
+                    )
+                if now > batch["expires_at"]:
+                    raise ApiError(
+                        409,
+                        "claim_expired",
+                        "this claim's lease has expired; claim again with a new "
+                        "request id to get a fresh credential",
+                    )
+                if self._reclaimed_elsewhere(conn, batch, notification_id):
+                    raise ApiError(
+                        409,
+                        "notification_reclaimed",
+                        "this notification has been re-claimed by a newer batch",
+                    )
+                if not self._notification_active(conn, notification_id):
+                    raise ApiError(
+                        409,
+                        "notification_inactive",
+                        "every trigger reason for this notification has lapsed",
+                    )
+                conn.execute(
+                    """
+                    UPDATE claim_items SET confirmed_at = ?
+                    WHERE batch_id = ? AND notification_id = ?
+                    """,
+                    (now, batch_id, notification_id),
+                )
+                return self._confirm_dict(
+                    batch_id,
+                    notification_id,
+                    now,
+                    already=False,
+                    message=self._notification_dict(conn, notification_id),
+                )
+
+    def _claim_replay_items(
+        self, conn: sqlite3.Connection, batch: sqlite3.Row
+    ) -> list[dict[str, Any]]:
+        """The replayable slice of an existing batch (no new items, no renewal)."""
+        rows = conn.execute(
+            """
+            SELECT ci.notification_id, ci.confirmed_at, n.seq
+            FROM claim_items ci
+            JOIN notifications n ON n.notification_id = ci.notification_id
+            WHERE ci.batch_id = ?
+            ORDER BY n.seq
+            """,
+            (batch["batch_id"],),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            if row["confirmed_at"] is not None:
+                continue
+            if not self._notification_active(conn, row["notification_id"]):
+                continue
+            if self._reclaimed_elsewhere(conn, batch, row["notification_id"]):
+                continue
+            items.append(self._notification_dict(conn, row["notification_id"]))
+        return items
+
+    def _claim_dict(
+        self, batch: sqlite3.Row, items: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return {
+            "batch_id": batch["batch_id"],
+            "request_id": batch["request_id"],
+            "expires_at": batch["expires_at"],
+            "items": items,
+        }
+
+    @staticmethod
+    def _confirm_dict(
+        batch_id: str,
+        notification_id: str,
+        confirmed_at: str,
+        *,
+        already: bool,
+        message: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "notification_id": notification_id,
+            "batch_id": batch_id,
+            "confirmed": True,
+            "already_confirmed": already,
+            "confirmed_at": confirmed_at,
+            "message": message,
+        }
+
+    def _lease_expiry(self, now_iso: str) -> str:
+        moment = datetime.strptime(now_iso, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc
+        )
+        return (
+            (moment + self._claim_lease)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+
+    @staticmethod
+    def _reclaimed_elsewhere(
+        conn: sqlite3.Connection, batch: sqlite3.Row, notification_id: str
+    ) -> bool:
+        """True when a newer batch also holds this notification (ownership moved)."""
+        row = conn.execute(
+            """
+            SELECT 1 FROM claim_items ci
+            JOIN claim_batches b ON b.batch_id = ci.batch_id
+            WHERE ci.notification_id = ? AND b.seq > ?
+            LIMIT 1
+            """,
+            (notification_id, batch["seq"]),
+        ).fetchone()
+        return row is not None
+
+    def _notification_active(
+        self, conn: sqlite3.Connection, notification_id: str
+    ) -> bool:
+        """A notification lives while its message is unretracted and at least
+        one trigger reason's source row (follow / membership) still exists."""
+        return bool(self._live_reason_kinds(conn, notification_id))
+
+    def _live_reason_kinds(
+        self, conn: sqlite3.Connection, notification_id: str
+    ) -> list[str]:
+        retracted = conn.execute(
+            """
+            SELECT m.retracted FROM notifications n
+            JOIN messages m ON m.id = n.message_id
+            WHERE n.notification_id = ?
+            """,
+            (notification_id,),
+        ).fetchone()
+        if retracted is None or retracted[0]:
+            return []
+        rows = conn.execute(
+            """
+            SELECT kind, source_id FROM notification_reasons
+            WHERE notification_id = ?
+            ORDER BY kind
+            """,
+            (notification_id,),
+        ).fetchall()
+        live: list[str] = []
+        for row in rows:
+            if row["kind"] == "follow":
+                found = conn.execute(
+                    "SELECT 1 FROM follows WHERE follow_id = ?",
+                    (row["source_id"],),
+                ).fetchone()
+            else:
+                found = conn.execute(
+                    "SELECT 1 FROM memberships WHERE membership_id = ?",
+                    (row["source_id"],),
+                ).fetchone()
+            if found is not None:
+                live.append(row["kind"])
+        return live
+
+    def _notification_dict(
+        self, conn: sqlite3.Connection, notification_id: str
+    ) -> dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT notification_id, conversation_id, message_id, created_at
+            FROM notifications WHERE notification_id = ?
+            """,
+            (notification_id,),
+        ).fetchone()
+        if row is None:  # pragma: no cover - internal invariant
+            raise ApiError(500, "internal_error", "notification is missing")
+        return {
+            "notification_id": row["notification_id"],
+            "conversation_id": row["conversation_id"],
+            "message": self._message_in_conversation(
+                conn, row["conversation_id"], row["message_id"]
+            ),
+            "reasons": self._live_reason_kinds(conn, notification_id),
+            "created_at": row["created_at"],
+        }
+
+    def _resolve_mentions(
+        self,
+        conn: sqlite3.Connection,
+        conversation_id: str,
+        mention_user_ids: list[str],
+    ) -> dict[str, str]:
+        """Map each mentioned user to their current membership id.
+
+        Mentioning a non-member rejects the whole append: the author must not
+        be able to aim notifications outside the conversation.
+        """
+        memberships: dict[str, str] = {}
+        for mentioned_id in mention_user_ids:
+            row = conn.execute(
+                """
+                SELECT membership_id FROM memberships
+                WHERE conversation_id = ? AND user_id = ?
+                """,
+                (conversation_id, mentioned_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(
+                    400,
+                    "mention_not_member",
+                    f"user {mentioned_id} is not a current member of this "
+                    "conversation and cannot be mentioned",
+                )
+            memberships[mentioned_id] = row["membership_id"]
+        return memberships
+
+    def _create_notifications(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        message_id: str,
+        conversation_id: str,
+        author_id: str,
+        mention_memberships: dict[str, str],
+        now: str,
+    ) -> list[str]:
+        """Fan out one notification per recipient for a fresh original message.
+
+        Recipients are the members following right now plus the mentioned
+        members, minus the author; a recipient in both groups gets a single
+        notification carrying both reasons. Nothing else in the system creates
+        notifications, so forks, joins and follows never backfill.
+        """
+        reasons: dict[str, dict[str, str]] = {}
+        follow_rows = conn.execute(
+            "SELECT follow_id, user_id FROM follows WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchall()
+        for row in follow_rows:
+            reasons.setdefault(row["user_id"], {})["follow"] = row["follow_id"]
+        for mentioned_id, membership_id in mention_memberships.items():
+            reasons.setdefault(mentioned_id, {})["mention"] = membership_id
+        reasons.pop(author_id, None)
+
+        notified: list[str] = []
+        for recipient_id, kinds in reasons.items():
+            notification_id = new_id("ntf")
+            conn.execute(
+                """
+                INSERT INTO notifications
+                    (notification_id, message_id, recipient_id,
+                     conversation_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (notification_id, message_id, recipient_id, conversation_id, now),
+            )
+            for kind, source_id in kinds.items():
+                conn.execute(
+                    """
+                    INSERT INTO notification_reasons
+                        (notification_id, kind, source_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (notification_id, kind, source_id),
+                )
+            notified.append(recipient_id)
+        return notified
+
 
     # ------------------------------------------------------------------
     # Events (commit order audit)

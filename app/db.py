@@ -115,6 +115,72 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_conversation
     ON events (conversation_id, seq);
 
+-- One row per follow *instance*. Unfollowing (or losing membership) deletes
+-- the row, so a notification reason that points at this follow_id goes dead
+-- and can never be revived: re-following inserts a brand new follow_id.
+CREATE TABLE IF NOT EXISTS follows (
+    follow_id       TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    created_at      TEXT NOT NULL,
+    UNIQUE (conversation_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_follows_user
+    ON follows (user_id);
+
+-- One offline notification per (original message, recipient). Created only on
+-- the append path of the origin conversation; forks, joins and follows never
+-- backfill. seq orders claims by original submission (commit) order.
+CREATE TABLE IF NOT EXISTS notifications (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    notification_id TEXT NOT NULL UNIQUE,
+    message_id      TEXT NOT NULL REFERENCES messages(id),
+    recipient_id    TEXT NOT NULL REFERENCES users(id),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    created_at      TEXT NOT NULL,
+    UNIQUE (message_id, recipient_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient
+    ON notifications (recipient_id, seq);
+
+-- Why a notification exists. A reason is live iff its source row still
+-- exists: a follow reason needs its follows row, a mention reason needs the
+-- membership instance it was minted from. Deleting the source (unfollow,
+-- member removal) kills the reason without touching history here.
+CREATE TABLE IF NOT EXISTS notification_reasons (
+    notification_id TEXT NOT NULL REFERENCES notifications(notification_id),
+    kind            TEXT NOT NULL CHECK (kind IN ('follow', 'mention')),
+    source_id       TEXT NOT NULL,
+    PRIMARY KEY (notification_id, kind, source_id)
+);
+
+-- One claim batch per (recipient, request_id): retrying a request returns the
+-- original batch instead of claiming again. expires_at is stored so leases
+-- keep expiring across process restarts.
+CREATE TABLE IF NOT EXISTS claim_batches (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     TEXT NOT NULL UNIQUE,
+    request_id   TEXT NOT NULL,
+    recipient_id TEXT NOT NULL REFERENCES users(id),
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    UNIQUE (recipient_id, request_id)
+);
+
+-- Batch membership plus the confirmation marker. A notification appears in
+-- several batches over time (re-claim after expiry); the newest batch owns it.
+CREATE TABLE IF NOT EXISTS claim_items (
+    batch_id        TEXT NOT NULL REFERENCES claim_batches(batch_id),
+    notification_id TEXT NOT NULL REFERENCES notifications(notification_id),
+    confirmed_at    TEXT,
+    PRIMARY KEY (batch_id, notification_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_items_notification
+    ON claim_items (notification_id);
+
 -- Defence in depth: messages are append-only. The only permitted UPDATE is the
 -- one that clears the body and flips the retraction marker. Origin identity and
 -- authorship can never be rewritten, and rows can never be deleted.

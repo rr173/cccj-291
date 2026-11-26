@@ -43,6 +43,9 @@ class CreateConversationRequest(StrictModel):
 class AppendMessageRequest(StrictModel):
     body: str = Field(min_length=1, max_length=20_000)
     client_token: str | None = Field(default=None, max_length=200)
+    # Members the author explicitly points out; each must be a current member
+    # of the conversation. Duplicates are collapsed, blanks rejected.
+    mention_user_ids: list[str] = Field(default_factory=list, max_length=100)
 
     @field_validator("body")
     @classmethod
@@ -57,6 +60,20 @@ class AppendMessageRequest(StrictModel):
         if value is not None and not value.strip():
             raise ValueError("client_token must not be blank")
         return value
+
+    @field_validator("mention_user_ids")
+    @classmethod
+    def _clean_mentions(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in value:
+            user_id = raw.strip()
+            if not user_id:
+                raise ValueError("mention_user_ids must not contain blank ids")
+            if len(user_id) > 100:
+                raise ValueError("mention_user_ids entries are too long")
+            if user_id not in cleaned:
+                cleaned.append(user_id)
+        return cleaned
 
 
 class ForkRequest(StrictModel):
@@ -76,6 +93,25 @@ class ForkRequest(StrictModel):
 
 class AddMemberRequest(StrictModel):
     user_id: str = Field(min_length=1, max_length=100)
+
+
+class ClaimRequest(StrictModel):
+    # Idempotency key, unique per user: retrying the same request_id returns
+    # the original batch (minus lapsed items) instead of claiming anew.
+    request_id: str = Field(min_length=1, max_length=200)
+    limit: int | None = Field(default=None, ge=1, le=100)
+
+    @field_validator("request_id")
+    @classmethod
+    def _request_id_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("request_id must not be blank")
+        return value
+
+
+class ConfirmRequest(StrictModel):
+    batch_id: str = Field(min_length=1, max_length=100)
+    notification_id: str = Field(min_length=1, max_length=100)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +231,43 @@ class EventOut(BaseModel):
     message_id: str | None
     details: dict[str, Any]
     occurred_at: str
+
+
+class FollowOut(BaseModel):
+    conversation_id: str
+    user_id: str
+    following: bool
+    followed_at: str | None
+
+
+class NotificationOut(BaseModel):
+    notification_id: str
+    # The conversation the original message was authored in.
+    conversation_id: str
+    message: MessageOut
+    # Trigger reasons that are still live at response time.
+    reasons: list[Literal["follow", "mention"]]
+    created_at: str
+
+
+class ClaimBatchOut(BaseModel):
+    # batch_id is the credential: it confirms this batch's items, only until
+    # expires_at, and only while each item's reasons are still live.
+    batch_id: str
+    request_id: str
+    expires_at: str
+    items: list[NotificationOut]
+
+
+class ConfirmOut(BaseModel):
+    notification_id: str
+    batch_id: str
+    confirmed: bool
+    already_confirmed: bool
+    confirmed_at: str
+    # Present on the first successful confirmation only; a retried confirm
+    # changes nothing and carries no body.
+    message: NotificationOut | None
 
 
 class HealthOut(BaseModel):

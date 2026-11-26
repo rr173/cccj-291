@@ -99,10 +99,13 @@ class Api:
         conversation_id: str,
         body: str,
         client_token: str | None = None,
+        mention_user_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"body": body}
         if client_token is not None:
             payload["client_token"] = client_token
+        if mention_user_ids is not None:
+            payload["mention_user_ids"] = mention_user_ids
         return self.request(
             "POST",
             f"/conversations/{conversation_id}/messages",
@@ -178,6 +181,31 @@ class Api:
 
     def retract(self, user: str, message_id: str) -> dict[str, Any]:
         return self.request("POST", f"/messages/{message_id}/retraction", user=user)
+
+    def follow(self, user: str, conversation_id: str) -> dict[str, Any]:
+        return self.request("POST", f"/conversations/{conversation_id}/follow", user=user)
+
+    def unfollow(self, user: str, conversation_id: str) -> Any:
+        return self.request("DELETE", f"/conversations/{conversation_id}/follow", user=user)
+
+    def follow_status(self, user: str, conversation_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/conversations/{conversation_id}/follow", user=user)
+
+    def claim(self, user: str, request_id: str, limit: int = 10) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/notifications/claim",
+            user=user,
+            body={"request_id": request_id, "limit": limit},
+        )
+
+    def confirm(self, user: str, batch_id: str, notification_id: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/notifications/confirm",
+            user=user,
+            body={"batch_id": batch_id, "notification_id": notification_id},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +598,118 @@ def retraction_scenario(api: Api, s: dict[str, Any], f: dict[str, Any]) -> dict[
     return {"fresh": fresh["id"], "retracted_at": result["retracted_at"]}
 
 
+def notification_scenario(api: Api, s: dict[str, Any]) -> dict[str, Any]:
+    banner("Offline notifications: follow, mention, claim, confirm")
+    root = s["root"]
+    # Carol joins the root so she is allowed to follow it.
+    api.add_member(s["alice"], root, s["carol"])
+
+    follow = api.follow(s["bob"], root)
+    check("following returns the status", follow["following"] is True and follow["followed_at"] is not None)
+    check("follow status is queryable", api.follow_status(s["bob"], root)["following"] is True)
+    expect_error(
+        "non-member cannot follow",
+        lambda: api.follow(s["dave"], root),
+        403,
+        "not_a_member",
+    )
+    expect_error(
+        "mentioning a non-member is rejected",
+        lambda: api.append(s["alice"], root, "ping", mention_user_ids=[s["dave"]]),
+        400,
+        "mention_not_member",
+    )
+
+    api.follow(s["carol"], root)
+    # Bob follows AND is mentioned: one notification carrying both reasons.
+    note_msg = api.append(
+        s["alice"], root, "Standup moved to 10:00", mention_user_ids=[s["bob"]]
+    )
+    batch = api.claim(s["bob"], "bob-phone")
+    check("follow+mention yields exactly one notification", len(batch["items"]) == 1)
+    item = batch["items"][0]
+    check(
+        "notification carries conversation, original message and both reasons",
+        item["conversation_id"] == root
+        and item["message"]["message_id"] == note_msg["message_id"]
+        and item["message"]["body"] == "Standup moved to 10:00"
+        and item["reasons"] == ["follow", "mention"],
+    )
+    replay = api.claim(s["bob"], "bob-phone")
+    check(
+        "replaying the claim request returns the same batch",
+        replay["batch_id"] == batch["batch_id"]
+        and [i["notification_id"] for i in replay["items"]] == [item["notification_id"]],
+    )
+    confirmed = api.confirm(s["bob"], batch["batch_id"], item["notification_id"])
+    check(
+        "first confirmation returns the body",
+        confirmed["already_confirmed"] is False
+        and confirmed["message"]["message"]["body"] == "Standup moved to 10:00",
+    )
+    again = api.confirm(s["bob"], batch["batch_id"], item["notification_id"])
+    check(
+        "replayed confirmation changes nothing and returns no body",
+        again["already_confirmed"] is True and again["message"] is None,
+    )
+
+    # Carol claims her follow-only notification but does not confirm: it must
+    # survive the restart still leased to this batch.
+    carol_batch = api.claim(s["carol"], "carol-tablet")
+    check(
+        "follower is notified of new original messages",
+        len(carol_batch["items"]) == 1
+        and carol_batch["items"][0]["reasons"] == ["follow"],
+    )
+
+    # Unfollow is idempotent and stops future notifications for Bob.
+    api.unfollow(s["bob"], root)
+    api.unfollow(s["bob"], root)
+    check("unfollow is idempotent", api.follow_status(s["bob"], root)["following"] is False)
+    api.append(s["alice"], root, "Bob will not get this one")
+    check(
+        "no new notifications after unfollow",
+        api.claim(s["bob"], "bob-phone-2")["items"] == [],
+    )
+    return {
+        "carol_batch_id": carol_batch["batch_id"],
+        "carol_notification_id": carol_batch["items"][0]["notification_id"],
+    }
+
+
+def verify_notifications_after_restart(api: Api, state: dict[str, Any]) -> None:
+    banner("After restart: notification inbox, batch ownership, confirmations")
+    s = state["seed"]
+    n = state["notifications"]
+
+    replay = api.claim(s["carol"], "carol-tablet")
+    check(
+        "unconfirmed notification survives restart in its batch",
+        replay["batch_id"] == n["carol_batch_id"]
+        and [i["notification_id"] for i in replay["items"]] == [n["carol_notification_id"]],
+    )
+    other = api.claim(s["carol"], "carol-other")
+    check(
+        "a different request cannot take the leased item",
+        n["carol_notification_id"] not in {i["notification_id"] for i in other["items"]},
+    )
+    confirmed = api.confirm(s["carol"], n["carol_batch_id"], n["carol_notification_id"])
+    check(
+        "pre-restart credential still confirms",
+        confirmed["already_confirmed"] is False
+        and confirmed["message"]["message"]["body"] == "Standup moved to 10:00",
+    )
+    again = api.confirm(s["carol"], n["carol_batch_id"], n["carol_notification_id"])
+    check(
+        "confirmation replay after restart returns no body",
+        again["already_confirmed"] is True and again["message"] is None,
+    )
+    check(
+        "confirmed items never come back",
+        api.claim(s["carol"], "carol-fresh")["items"] == [],
+    )
+
+
 def verify_after_restart(api: Api, state: dict[str, Any]) -> None:
     banner("After restart: lineage, membership, retraction, cursors")
     s, f = state["seed"], state["forks"]
@@ -642,6 +782,7 @@ def main() -> int:
         state["pre_restart_cursor"] = api.messages(
             state["seed"]["carol"], state["forks"]["child"], limit=1
         )["next_cursor"]
+        state["notifications"] = notification_scenario(api, state["seed"])
     finally:
         banner("Restarting the server against the same database")
         stop_server(server)
@@ -651,6 +792,7 @@ def main() -> int:
 
     try:
         verify_after_restart(server.api, state)
+        verify_notifications_after_restart(server.api, state)
     finally:
         stop_server(server)
 
