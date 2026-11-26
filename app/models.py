@@ -263,6 +263,36 @@ class ApproveResolutionProposalRequest(StrictModel):
         return cleaned or None
 
 
+class SyncPullRequest(StrictModel):
+    """One device's resume point and batch bound.
+
+    ``device_id`` names the physical replica so that a cursor cannot be used
+    by another device of the same account. ``cursor`` is the opaque server
+    progress token from the previous applied batch; ``None`` starts from an
+    empty replica.
+    """
+
+    device_id: str = Field(min_length=1, max_length=200)
+    cursor: str | None = Field(default=None, max_length=8192)
+    limit: int | None = Field(default=None, ge=1, le=500)
+
+    @field_validator("device_id")
+    @classmethod
+    def _device_non_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("device_id must not be blank")
+        return cleaned
+
+    @field_validator("cursor")
+    @classmethod
+    def _cursor_non_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
@@ -422,3 +452,53 @@ class ConfirmOut(BaseModel):
 class HealthOut(BaseModel):
     status: Literal["ok"]
     database: str
+
+
+class SyncProgressOut(BaseModel):
+    # Highest applied sync_changes.seq, and the conversation whose one-time
+    # history walk is mid-flight (its position is inside next_cursor).
+    after_seq: int
+    loading_conversation_id: str | None
+
+
+class SyncConversationGrantOut(BaseModel):
+    type: Literal["conversation.granted"]
+    conversation_id: str
+    membership_id: str
+    # Message positions 1..history_max_position of this branch are delivered as
+    # ``message`` items; a device clears that conversation's local state under
+    # this membership_id before applying them.
+    history_max_position: int
+    conversation: ConversationOut
+    seq: int
+
+
+class SyncMessageOut(BaseModel):
+    type: Literal["message"]
+    conversation_id: str
+    membership_id: str
+    position: int
+    message: MessageOut
+    seq: int | None
+
+
+class SyncConversationClearedOut(BaseModel):
+    type: Literal["conversation.cleared"]
+    conversation_id: str
+    # Only a local copy loaded under this membership_id may be deleted; a newer
+    # identity's copy is left alone and a following grant reloads it.
+    membership_id: str
+    reason: str
+    seq: int
+
+
+class SyncPullResponse(BaseModel):
+    items: list[
+        SyncConversationGrantOut | SyncMessageOut | SyncConversationClearedOut
+    ]
+    # True while more changes are pending; keep pulling with next_cursor.
+    has_more: bool
+    # True when this batch consumed every change committed so far.
+    caught_up: bool
+    next_cursor: str
+    progress: SyncProgressOut

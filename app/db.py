@@ -115,6 +115,54 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_conversation
     ON events (conversation_id, seq);
 
+-- ---------------------------------------------------------------------------
+-- Desktop replica sync
+--
+-- One row per *user-visible* change. Rows are fanned out to every membership
+-- instance that can observe the change at commit time, so a late pull is a
+-- simple indexed scan of this user's rows -- never a diff over all messages.
+--
+-- membership_id pins the authorisation identity the change was delivered
+-- under. If that membership has since been removed (or replaced by a new
+-- instance after a re-invite), the row is stale: the pull skips its body and
+-- the matching `membership.revoked` change tells the device to clear the
+-- conversation. max_position on a grant is the conversation's history
+-- watermark at grant time; the grant-driven history load walks exactly that
+-- prefix, while later appends arrive as ordinary change rows.
+CREATE TABLE IF NOT EXISTS sync_changes (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    membership_id   TEXT NOT NULL,
+    kind            TEXT NOT NULL
+        CHECK (kind IN (
+            'message.appended',
+            'message.retracted',
+            'membership.granted',
+            'membership.revoked'
+        )),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    message_id      TEXT REFERENCES messages(id),
+    position        INTEGER,
+    max_position    INTEGER,
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_changes_user_seq
+    ON sync_changes (user_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_sync_changes_membership
+    ON sync_changes (membership_id);
+
+-- A membership instance is granted once and revoked once. These partial
+-- indexes make the bootstrap/backfill idempotent and reject duplicate rows.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_grant_membership
+    ON sync_changes (membership_id)
+    WHERE kind = 'membership.granted';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_revocation_membership
+    ON sync_changes (membership_id)
+    WHERE kind = 'membership.revoked';
+
 -- One row per follow *instance*. Unfollowing (or losing membership) deletes
 -- the row, so a notification reason that points at this follow_id goes dead
 -- and can never be revived: re-following inserts a brand new follow_id.

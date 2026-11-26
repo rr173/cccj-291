@@ -53,6 +53,7 @@ There is no password/token provider — this is a local, reproducible service.
 | Why a notification exists | `notification_reasons` — points at a `follow_id` or `membership_id` |
 | Claim batch (the credential) | `claim_batches`, unique per (recipient, request_id), with `expires_at` |
 | Batch contents | `claim_items` — plus the confirmation marker |
+| Desktop replica change log | `sync_changes` — one row per user-visible change, fanned out to each observing membership instance |
 | Resolution proposal/package | `resolution_proposals`, `resolution_proposal_items`, evidence and dependency pins |
 | Passed resolution versions | `resolutions`, `resolution_evidence`, `resolution_dependencies` |
 | Current parent board pointer | `resolution_board` — effective or `pending_reconsideration` per `(parent, topic)` |
@@ -182,7 +183,103 @@ body. Batches, leases and confirmations are plain SQLite rows, so they survive
 restarts.
 
 
-### Ordering and races
+### Desktop replica sync
+
+A desktop client keeps a local copy of the chats of one account. It does not
+re-download history on every launch. Instead it starts from an empty copy once
+and thereafter pulls only changes. The server keeps no per-device state: every
+user-visible change is appended to `sync_changes` when it commits, fanned out to
+each membership instance that can see it, and a pull is an indexed walk of that
+account's rows. The incremental path never diffs or scans the message table
+(only a one-time history load for a conversation a device just received, bounded
+by its grant's `history_max_position`).
+
+Capture is inside the same write transaction as the change itself:
+
+| Change | Sync row(s) |
+| --- | --- |
+| membership created (create, fork, invite) | `membership.granted` with the branch's current `max_position` |
+| message appended | `message.appended` for every **current member instance** of that conversation |
+| message retracted | `message.retracted` for every membership of **every branch** that references the message — the author's own branches are irrelevant |
+| membership removed | `membership.revoked` for the removed instance |
+
+`POST /sync/pull` takes `{device_id, cursor?, limit?}` and returns one batch:
+
+```json
+{
+  "items": [
+    {"type": "conversation.granted", "conversation_id": "cvs_…", "membership_id": "mem_…",
+     "history_max_position": 7, "conversation": {…}, "seq": 41},
+    {"type": "message", "conversation_id": "cvs_…", "membership_id": "mem_…",
+     "position": 1, "message": {…same shape as GET messages…}, "seq": null},
+    {"type": "conversation.cleared", "conversation_id": "cvs_…", "membership_id": "mem_…",
+     "reason": "membership_revoked", "seq": 45}
+  ],
+  "has_more": true,
+  "caught_up": false,
+  "next_cursor": "…signed, bound to account AND device…",
+  "progress": {"after_seq": 41, "loading_conversation_id": "cvs_…"}
+}
+```
+
+Item semantics:
+
+* **`conversation.granted`** — the identity `membership_id` may read this
+  conversation. Its messages follow as `message` items for positions
+  `1..history_max_position`, possibly over several batches. On a *new*
+  `membership_id`, discard any local copy loaded under an older one and reload.
+* **`message`** — a message at its branch position, identical to the message
+  API: same original id, author, origin, `source`, and a retracted message is a
+  placeholder (`body: null`). Upsert by `(conversation_id, position)`. The body
+  is read in the same snapshot as the rest of the batch.
+* **`conversation.cleared`** — delete this conversation's local copy, but only
+  if it was loaded under this `membership_id`. Other conversations are
+  untouched, even when they hold the same original message. A late clear for an
+  old identity cannot delete a newer identity's copy.
+
+Client protocol:
+
+1. Start with no cursor and an empty replica.
+2. `POST /sync/pull`. Apply the whole `items` list and *then* save
+   `next_cursor`, in one local transaction (or build the next state and swap it
+   in). If applying fails, keep the old cursor.
+3. Repeat while `has_more` is true. `caught_up == true` (equivalently
+   `has_more == false`) means the replica now reflects every committed change.
+4. On the next launch, send the saved cursor; a caught-up replica usually gets
+   an empty batch immediately.
+
+Guarantees that make retries safe:
+
+* **Same response, same snapshot.** One batch read comes from one SQLite
+  snapshot; every `message` body in it is readable by the account at that
+  instant, and retraction state is already applied.
+* **Retry from the old cursor.** Progress is a position in the append-only log,
+  not a watermark on rows. A lost response is retried from the last *applied*
+  cursor: that sequence range is recomputed against a fresh snapshot, so no
+  change is skipped and a message retracted meanwhile arrives as a placeholder,
+  never with its old text.
+* **Stale rows are never sent.** An append/retraction row whose membership
+  instance has since been removed is skipped by the server (progress still
+  advances), so unreadable bodies are not re-sent.
+* **Identity cannot leak across a re-invite.** A re-invite mints a new
+  `membership_id`; its grant and history are separate. A half-finished walk
+  under the old identity is abandoned (the revocation clears the old copy) and
+  the new identity reloads the branch from its own watermark.
+* **Per-device progress.** The cursor is HMAC-signed and bound to the account
+  *and* `device_id`; another account or device gets `400 invalid_cursor` and
+  cannot advance or reuse it. Pulling on one device never moves another's
+  progress.
+* **Convergence.** With writes stopped, consecutive pulls advance to empty
+  batches in finitely many requests. Each response is bounded even if most
+  scanned rows are stale or a grant's history page is short.
+
+Databases created before this feature have no sync log; the first pull by a
+user synthesizes grants for their existing memberships at the current
+watermark, so the change log stays additive (`CREATE TABLE/INDEX IF NOT
+EXISTS`). Notifications, resolution boards and member rosters are not part of
+the replica and are not synced.
+
+
 
 Every write runs in its own connection inside `BEGIN IMMEDIATE`, so sequence
 allocation, fork materialisation, append and retraction are serialised by
@@ -312,6 +409,17 @@ pending topic as:
 | `POST` | `/messages/{message_id}/retraction` | author only; idempotent |
 | `GET` | `/conversations/{id}/events` | `after_seq`, `limit`; commit-ordered audit for this branch |
 
+### Replica sync
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/sync/pull` | `{device_id, cursor?, limit?}` → one batch with the next change items; see [Desktop replica sync](#desktop-replica-sync) |
+
+`limit` is 1–500 (default 100) and bounds the number of items in the response.
+The cursor is opaque and bound to the account and `device_id`; omitting it
+starts from an empty replica. Errors: `400 invalid_cursor` for a cursor from
+another account/devic
+
 ### Follows
 
 | Method | Path | Notes |
@@ -361,15 +469,18 @@ timestamp.
 
 ## Tests and demo
 
-* `tests/` — 62 tests covering two-level forks, cross-branch retraction,
+* `tests/` — 81 tests covering two-level forks, cross-branch retraction,
   idempotent retries, cursor invalidation, snapshot-consistent paging, race
   outcomes, restart persistence, storage-level immutability, the
-  notification inbox, and cross-branch resolution packages: atomic approval,
+  notification inbox, cross-branch resolution packages (atomic approval,
   parent/proposer authorization, evidence privacy and redaction, submission
   pins, stale/external conflicts, leave-and-rejoin membership identity,
-  idempotent approval replay, and retraction/replacement invalidation chains.
-* `tests/test_resolutions.py` can be run alone with
-  `.venv/bin/python -m pytest tests/test_resolutions.py -q`.
+  idempotent approval replay, and retraction/replacement invalidation chains),
+  and desktop replica sync (bootstrap, paged history with concurrent writes,
+  retraction across branches, identity-scoped clearing, device-bound progress,
+  lost-response retry, convergence and restart).
+* `tests/test_resolutions.py` and `tests/test_sync.py` can be run alone with
+  `.venv/bin/python -m pytest tests/test_sync.py -q`.
 * `scripts/verify_resolutions.py` — self-contained HTTP-level narrative check
   using FastAPI `TestClient` against a temporary SQLite file. It
   creates users and branches, approves a package with internal and external
@@ -381,7 +492,21 @@ timestamp.
   .venv/bin/python scripts/verify_resolutions.py
   ```
 
-  It prints `33 checks passed` and exits non-zero on failure.
+  It prints `N checks passed` and exits non-zero on failure.
+* `scripts/verify_sync.py` — self-contained HTTP-level check of the desktop
+  replica. It drives `scripts/replica.py` (which applies batches exactly as a
+  client would) from empty through paged bootstrap, interrupted walks with
+  concurrent appends/retractions/membership changes, a lost response retried
+  from old progress, cross-branch retraction, offline remove/re-invite,
+  conversation-scoped clearing, per-device cursor binding, convergence to empty
+  batches, and a service restart. Every scenario compares the reconstructed
+  copy with `GET /conversations/{id}/messages`. Run:
+
+  ```bash
+  python3 scripts/verify_sync.py
+  ```
+
+  It prints `72 checks passed` and exits non-zero on failure.
 * `scripts/demo.py` — starts a real uvicorn server, drives it over HTTP as
   Alice/Bob/Carol/Dave, exercises two fork levels, parent/child divergence,
   cross-branch retraction and old cursors, the follow → mention → claim →

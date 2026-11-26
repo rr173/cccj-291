@@ -44,6 +44,8 @@ from .models import (
     MessagePage,
     RetractionOut,
     SearchPage,
+    SyncPullRequest,
+    SyncPullResponse,
     UserOut,
 )
 from .service import ConversationService
@@ -665,6 +667,27 @@ def create_app(database_path: str | None = None) -> FastAPI:
         service.authenticate(user_id)
         return service.confirm_notification(
             user_id, body.batch_id, body.notification_id
+        )
+
+    # ------------------------------------------------------------------
+    # Desktop replica sync
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/sync/pull",
+        response_model=SyncPullResponse,
+        tags=["sync"],
+        summary=(
+            "Pull the next batch of changes for one device's replica; retrying "
+            "an old cursor replays that sequence range against a fresh snapshot"
+        ),
+    )
+    def pull_sync(
+        body: SyncPullRequest, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.pull_sync(
+            user_id, body.device_id, body.cursor, body.limit
         )
 
     # ------------------------------------------------------------------

@@ -24,6 +24,7 @@ from .cursor import CursorCodec, InvalidCursor, query_fingerprint
 from .db import Database, read_transaction, write_transaction
 from .errors import ApiError
 from .resolutions import ResolutionMixin
+from .sync import SyncMixin
 
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
@@ -70,7 +71,7 @@ def clamp_limit(limit: int | None) -> int:
     return max(1, min(int(limit), MAX_PAGE_SIZE))
 
 
-class ConversationService(ResolutionMixin):
+class ConversationService(ResolutionMixin, SyncMixin):
     def __init__(
         self,
         db_path: str,
@@ -267,6 +268,13 @@ class ConversationService(ResolutionMixin):
                 conn.execute(
                     "DELETE FROM memberships WHERE membership_id = ?",
                     (target["membership_id"],),
+                )
+                self._sync_record_revocation(
+                    conn,
+                    conversation_id,
+                    target["membership_id"],
+                    user_id,
+                    now,
                 )
                 # Losing membership ends every reason this membership instance
                 # carried: mention reasons reference the deleted membership_id
@@ -490,6 +498,9 @@ class ConversationService(ResolutionMixin):
                     author_id=user_id,
                     mention_memberships=mention_memberships,
                     now=now,
+                )
+                self._sync_record_append(
+                    conn, conversation_id, position, message_id, now
                 )
                 self._record_event(
                     conn,
@@ -892,6 +903,10 @@ class ConversationService(ResolutionMixin):
                 self.invalidate_board_for_retracted_message(
                     conn, message_id, actor_id, now
                 )
+                # Fan the placeholder out to every branch that holds a copy of
+                # this message through its own members, whether or not the
+                # author belongs to that branch.
+                self._sync_record_retraction(conn, message_id, now)
                 # One audit row in the origin and one in each branch that holds
                 # a reference: every branch's log explains why its view changed,
                 # even for readers who never had access to the author's branch.
@@ -1459,6 +1474,10 @@ class ConversationService(ResolutionMixin):
             """,
             (membership_id, conversation_id, user_id, role, added_by, now),
         )
+        # A new membership instance is a new sync identity. Its grant carries
+        # the branch's current history watermark, so a device joining an
+        # existing conversation loads that history exactly once.
+        self._sync_record_grant(conn, conversation_id, membership_id, now)
         return membership_id
 
     def _author_ref(self, conn: sqlite3.Connection, user_id: str) -> dict[str, str]:
