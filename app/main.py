@@ -1,0 +1,338 @@
+"""HTTP surface.
+
+Identity is carried by the ``X-User-Id`` header (no auth provider needed for a
+local, reproducible service). Every conversation route requires membership;
+nothing is inherited from a parent conversation's membership.
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated, Any
+
+from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import Response
+
+from .errors import (
+    ApiError,
+    api_error_handler,
+    unhandled_error_handler,
+    validation_error_handler,
+)
+from .models import (
+    AddMemberRequest,
+    AppendMessageRequest,
+    ConversationDetail,
+    ConversationOut,
+    CreateConversationRequest,
+    CreateUserRequest,
+    EventOut,
+    ForkRequest,
+    HealthOut,
+    MemberOut,
+    MessageOut,
+    MessagePage,
+    RetractionOut,
+    SearchPage,
+    UserOut,
+)
+from .service import ConversationService
+
+
+def default_database_path() -> str:
+    return os.environ.get(
+        "CONVERSATIONS_DB",
+        str(Path(__file__).resolve().parent.parent / "data" / "conversations.sqlite3"),
+    )
+
+
+def get_service(request: Request) -> ConversationService:
+    service = getattr(request.app.state, "service", None)
+    if service is None:
+        raise ApiError(503, "not_ready", "service is starting up")
+    return service
+
+
+def current_user_id(
+    x_user_id: Annotated[str | None, Header(alias="X-User-Id")] = None,
+) -> str:
+    if x_user_id is None or not x_user_id.strip():
+        raise ApiError(401, "missing_user", "the X-User-Id header is required")
+    return x_user_id.strip()
+
+
+ServiceDep = Annotated[ConversationService, Depends(get_service)]
+UserDep = Annotated[str, Depends(current_user_id)]
+
+
+def create_app(database_path: str | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.service = ConversationService(database_path or default_database_path())
+        yield
+
+    app = FastAPI(
+        title="Branched Conversations",
+        version="1.0.0",
+        description=(
+            "Multi-user conversations with fork-from-here and global, "
+            "author-driven retraction."
+        ),
+        lifespan=lifespan,
+    )
+    app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(Exception, unhandled_error_handler)
+
+    @app.get("/health", response_model=HealthOut, tags=["system"])
+    def health(service: ServiceDep) -> dict[str, Any]:
+        return {"status": "ok", "database": service.db.path}
+
+    # ------------------------------------------------------------------
+    # Users
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/users",
+        response_model=UserOut,
+        status_code=201,
+        tags=["users"],
+        summary="Register a user",
+    )
+    def create_user(body: CreateUserRequest, service: ServiceDep) -> dict[str, Any]:
+        return service.create_user(body.display_name)
+
+    @app.get(
+        "/users/{user_id}",
+        response_model=UserOut,
+        tags=["users"],
+        summary="Look up a user",
+    )
+    def get_user(user_id: str, service: ServiceDep) -> dict[str, Any]:
+        return service.get_user(user_id)
+
+    # ------------------------------------------------------------------
+    # Conversations
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/conversations",
+        response_model=ConversationDetail,
+        status_code=201,
+        tags=["conversations"],
+        summary="Create a conversation (creator becomes sole owner)",
+    )
+    def create_conversation(
+        body: CreateConversationRequest, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.create_conversation(user_id, body.title)
+
+    @app.get(
+        "/conversations",
+        response_model=list[ConversationOut],
+        tags=["conversations"],
+        summary="List conversations the caller currently belongs to",
+    )
+    def list_conversations(
+        user_id: UserDep, service: ServiceDep
+    ) -> list[dict[str, Any]]:
+        service.authenticate(user_id)
+        return service.list_conversations(user_id)
+
+    @app.get(
+        "/conversations/{conversation_id}",
+        response_model=ConversationDetail,
+        tags=["conversations"],
+        summary="Conversation metadata, fork provenance and members",
+    )
+    def get_conversation(
+        conversation_id: str, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_conversation(conversation_id, user_id)
+
+    @app.post(
+        "/conversations/{conversation_id}/fork",
+        response_model=ConversationDetail,
+        status_code=201,
+        tags=["conversations"],
+        summary="Fork from one currently visible message (declared before append)",
+    )
+    def fork_conversation(
+        conversation_id: str,
+        body: ForkRequest,
+        user_id: UserDep,
+        service: ServiceDep,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.fork_conversation(
+            conversation_id, user_id, body.parent_message_id, body.title
+        )
+
+    # ------------------------------------------------------------------
+    # Members
+    # ------------------------------------------------------------------
+
+    @app.get(
+        "/conversations/{conversation_id}/members",
+        response_model=list[MemberOut],
+        tags=["members"],
+        summary="List members of this conversation only",
+    )
+    def list_members(
+        conversation_id: str, user_id: UserDep, service: ServiceDep
+    ) -> list[dict[str, Any]]:
+        service.authenticate(user_id)
+        return service.list_members(conversation_id, user_id)
+
+    @app.post(
+        "/conversations/{conversation_id}/members",
+        response_model=MemberOut,
+        status_code=201,
+        tags=["members"],
+        summary="Invite a user to this conversation (owner only)",
+    )
+    def add_member(
+        conversation_id: str,
+        body: AddMemberRequest,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        member, created = service.add_member(conversation_id, user_id, body.user_id)
+        if not created:
+            response.status_code = 200
+        return member
+
+    @app.delete(
+        "/conversations/{conversation_id}/members/{member_user_id}",
+        status_code=204,
+        tags=["members"],
+        summary="Remove a member; their outstanding page cursors stop working",
+    )
+    def remove_member(
+        conversation_id: str,
+        member_user_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+    ) -> Response:
+        service.authenticate(user_id)
+        service.remove_member(conversation_id, user_id, member_user_id)
+        return Response(status_code=204)
+
+    # ------------------------------------------------------------------
+    # Messages
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/conversations/{conversation_id}/messages",
+        response_model=MessageOut,
+        status_code=201,
+        tags=["messages"],
+        summary="Append an immutable message (idempotent with client_token)",
+    )
+    def append_message(
+        conversation_id: str,
+        body: AppendMessageRequest,
+        user_id: UserDep,
+        service: ServiceDep,
+        response: Response,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        message, created = service.append_message(
+            conversation_id, user_id, body.body, body.client_token
+        )
+        # A retry returns the original result rather than creating a new one.
+        if not created:
+            response.status_code = 200
+        return message
+
+    @app.get(
+        "/conversations/{conversation_id}/messages",
+        response_model=MessagePage,
+        tags=["messages"],
+        summary="Page through inherited + local history in order",
+    )
+    def list_messages(
+        conversation_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+        cursor: Annotated[str | None, Query(max_length=4096)] = None,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.list_messages(conversation_id, user_id, limit, cursor)
+
+    @app.get(
+        "/conversations/{conversation_id}/messages/{message_id}",
+        response_model=MessageOut,
+        tags=["messages"],
+        summary="Read one message through this branch's view (with its origin)",
+    )
+    def get_message(
+        conversation_id: str,
+        message_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.get_message(conversation_id, user_id, message_id)
+
+    @app.get(
+        "/conversations/{conversation_id}/search",
+        response_model=SearchPage,
+        tags=["messages"],
+        summary="Case-insensitive keyword search inside this branch's view",
+    )
+    def search_messages(
+        conversation_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        q: Annotated[str, Query(min_length=1, max_length=500)],
+        limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+        cursor: Annotated[str | None, Query(max_length=4096)] = None,
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.search_messages(conversation_id, user_id, q, limit, cursor)
+
+    @app.post(
+        "/messages/{message_id}/retraction",
+        response_model=RetractionOut,
+        tags=["messages"],
+        summary="Author retracts the original message everywhere (idempotent)",
+    )
+    def retract_message(
+        message_id: str, user_id: UserDep, service: ServiceDep
+    ) -> dict[str, Any]:
+        service.authenticate(user_id)
+        return service.retract_message(message_id, user_id)
+
+    # ------------------------------------------------------------------
+    # Audit
+    # ------------------------------------------------------------------
+
+    @app.get(
+        "/conversations/{conversation_id}/events",
+        response_model=list[EventOut],
+        tags=["audit"],
+        summary="Append-only commit-ordered event log for this conversation",
+    )
+    def list_events(
+        conversation_id: str,
+        user_id: UserDep,
+        service: ServiceDep,
+        after_seq: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+    ) -> list[dict[str, Any]]:
+        service.authenticate(user_id)
+        return service.list_events(conversation_id, user_id, after_seq, limit)
+
+    return app
+
+
+app = create_app()
